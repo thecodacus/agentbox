@@ -4,12 +4,17 @@ const express = require('express');
 const { z } = require('zod');
 
 const MANAGER_URL = process.env.MANAGER_URL || 'http://localhost:4000';
+const MANAGER_TOKEN = process.env.MANAGER_TOKEN || '';
 
 async function managerFetch(path, options = {}) {
   const url = `${MANAGER_URL}${path}`;
   const res = await fetch(url, {
     ...options,
-    headers: { 'Content-Type': 'application/json', ...options.headers },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(MANAGER_TOKEN ? { Authorization: `Bearer ${MANAGER_TOKEN}` } : {}),
+      ...options.headers,
+    },
   });
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('image/')) {

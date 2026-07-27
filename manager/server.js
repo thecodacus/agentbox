@@ -1,10 +1,51 @@
 const express = require('express');
 const Docker = require('dockerode');
 const http = require('http');
+const crypto = require('crypto');
 
 const docker = new Docker({ socketPath: '/var/run/docker.sock' });
 const app = express();
 app.use(express.json());
+
+// The manager holds the Docker socket, so reaching it is equivalent to
+// controlling every container on the host. Sandboxes share agentbox-net with it
+// and can therefore address it directly by container IP — publishing ports only
+// on loopback does NOT protect against that. A shared secret does.
+const MANAGER_TOKEN = process.env.MANAGER_TOKEN || '';
+
+if (!MANAGER_TOKEN) {
+  console.warn(
+    '\n  WARNING: MANAGER_TOKEN is not set — the manager API is unauthenticated.\n' +
+    '  Any container on agentbox-net (including sandboxes running LLM-written\n' +
+    '  code) can spawn containers, start deployments and delete volumes.\n' +
+    '  Generate one with:  openssl rand -hex 32\n'
+  );
+}
+
+/** Constant-time compare so the token can't be recovered by timing the response. */
+function tokensMatch(provided, expected) {
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+app.use((req, res, next) => {
+  if (!MANAGER_TOKEN) return next(); // unauthenticated mode — warned about at boot
+  if (req.path === '/health') return next();
+
+  const header = req.get('authorization') || '';
+  const provided = header.startsWith('Bearer ')
+    ? header.slice(7)
+    : req.get('x-agentbox-token') || '';
+
+  if (!provided || !tokensMatch(provided, MANAGER_TOKEN)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 const SANDBOX_IMAGES = {
   browser: 'agentbox-sandbox',
@@ -17,6 +58,58 @@ const DEPLOYMENT_IMAGES = {
 };
 const NETWORK_NAME = 'agentbox-net';
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+// Capabilities are dropped wholesale and only these are handed back: enough for
+// the image entrypoint to fix the mounted volume's ownership (CHOWN/DAC_OVERRIDE/
+// FOWNER) and drop to the unprivileged user (SETUID/SETGID). Once it has dropped
+// privileges the workload itself holds no capabilities at all.
+//
+// Notably absent: SYS_ADMIN. Chromium already launches with --no-sandbox, so it
+// never needed the one capability most associated with container escapes.
+const REQUIRED_CAPS = ['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETUID', 'SETGID'];
+
+/** Capability + privilege-escalation hardening applied to every spawned container. */
+function securityHardening() {
+  return {
+    CapDrop: ['ALL'],
+    CapAdd: [...REQUIRED_CAPS],
+    SecurityOpt: ['no-new-privileges'],
+  };
+}
+// Resource caps for spawned containers. These run code an LLM just wrote, so an
+// infinite loop, a memory balloon or a fork bomb is an ordinary Tuesday — without
+// limits any of them takes the host down with it.
+const MB = 1024 * 1024;
+const num = (v, fallback) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : fallback);
+
+const SANDBOX_MEMORY_MB = num(process.env.SANDBOX_MEMORY_MB, 1024);
+// Chromium is heavy and its /dev/shm counts against the container's memory
+// cgroup, so browser sandboxes get a higher ceiling than shell ones.
+const BROWSER_MEMORY_MB = num(process.env.BROWSER_MEMORY_MB, 3072);
+const SANDBOX_CPUS = num(process.env.SANDBOX_CPUS, 1);
+const BROWSER_CPUS = num(process.env.BROWSER_CPUS, 2);
+const SANDBOX_PIDS_LIMIT = num(process.env.SANDBOX_PIDS_LIMIT, 256);
+const BROWSER_PIDS_LIMIT = num(process.env.BROWSER_PIDS_LIMIT, 512);
+const DEPLOYMENT_MEMORY_MB = num(process.env.DEPLOYMENT_MEMORY_MB, 512);
+const DEPLOYMENT_CPUS = num(process.env.DEPLOYMENT_CPUS, 1);
+const DEPLOYMENT_PIDS_LIMIT = num(process.env.DEPLOYMENT_PIDS_LIMIT, 128);
+
+/**
+ * Docker resource limits. MemorySwap === Memory disables swap, so a container
+ * that hits its ceiling is OOM-killed instead of dragging the host into swap.
+ */
+function resourceLimits(memoryMb, cpus, pidsLimit) {
+  return {
+    Memory: memoryMb * MB,
+    MemorySwap: memoryMb * MB,
+    NanoCpus: Math.round(cpus * 1e9),
+    PidsLimit: pidsLimit,
+  };
+}
+// Host interface published container ports bind to. Defaults to loopback so
+// sandboxes and deployments are not reachable from the rest of the network.
+// Set BIND_HOST=0.0.0.0 only if you deliberately want LAN access.
+const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 
 // Docker volume name: letters/digits/underscore/dot/dash, must start alphanumeric.
 // Rejects host paths (/, :, ..) so a malicious client can't bind-mount host dirs.
@@ -116,12 +209,19 @@ app.post('/sandboxes', async (req, res) => {
 
     const isBrowser = type === 'browser';
     const MOUNT_TARGET = '/workspace';
+    // The sandbox control API (8080) is deliberately NOT published: it is
+    // unauthenticated, and the manager reaches it over the internal network by
+    // container IP. Only noVNC is published, on the loopback interface.
     const containerConfig = {
       Image: image,
       HostConfig: {
-        PublishAllPorts: true,
         NetworkMode: NETWORK_NAME,
         Binds: [],
+        ...securityHardening(),
+        ...(isBrowser
+          ? resourceLimits(BROWSER_MEMORY_MB, BROWSER_CPUS, BROWSER_PIDS_LIMIT)
+          : resourceLimits(SANDBOX_MEMORY_MB, SANDBOX_CPUS, SANDBOX_PIDS_LIMIT)),
+        PortBindings: {},
       },
       ExposedPorts: { '8080/tcp': {} },
     };
@@ -131,9 +231,13 @@ app.post('/sandboxes', async (req, res) => {
     }
 
     if (isBrowser) {
-      containerConfig.HostConfig.CapAdd = ['SYS_ADMIN'];
+      // No SYS_ADMIN: Chromium runs with --no-sandbox, verified working without it.
       containerConfig.HostConfig.ShmSize = 2 * 1024 * 1024 * 1024;
       containerConfig.ExposedPorts['6080/tcp'] = {};
+      // Empty HostPort => Docker picks a free port, as before.
+      containerConfig.HostConfig.PortBindings['6080/tcp'] = [
+        { HostIp: BIND_HOST, HostPort: '' },
+      ];
     }
 
     const container = await docker.createContainer(containerConfig);
@@ -268,7 +372,11 @@ app.post('/deployments', async (req, res) => {
     await ensureNetwork();
 
     const exposedPorts = {};
-    for (const p of portList) exposedPorts[`${p}/tcp`] = {};
+    const portBindings = {};
+    for (const p of portList) {
+      exposedPorts[`${p}/tcp`] = {};
+      portBindings[`${p}/tcp`] = [{ HostIp: BIND_HOST, HostPort: '' }];
+    }
 
     const container = await docker.createContainer({
       Image: image,
@@ -277,8 +385,10 @@ app.post('/deployments', async (req, res) => {
       ExposedPorts: exposedPorts,
       HostConfig: {
         Binds: [`${volume}:/workspace`],
-        PublishAllPorts: true,
+        PortBindings: portBindings,
         NetworkMode: NETWORK_NAME,
+        ...securityHardening(),
+        ...resourceLimits(DEPLOYMENT_MEMORY_MB, DEPLOYMENT_CPUS, DEPLOYMENT_PIDS_LIMIT),
       },
       Labels: { 'agentbox.deployment': 'true' },
     });

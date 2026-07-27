@@ -1,6 +1,6 @@
 import { getDeployment, deleteDeployment, updateDeploymentStatus } from "@/lib/db";
 
-const MANAGER_URL = process.env.MANAGER_URL || "http://localhost:4000";
+import { MANAGER_URL, managerHeaders } from "@/lib/manager";
 
 export async function GET(
   req: Request,
@@ -12,7 +12,9 @@ export async function GET(
 
   // Fetch live status from manager
   try {
-    const res = await fetch(`${MANAGER_URL}/deployments/${deployment.container_id}/status`);
+    const res = await fetch(`${MANAGER_URL}/deployments/${deployment.container_id}/status`, {
+      headers: managerHeaders(),
+    });
     if (res.ok) {
       const { running, status } = await res.json();
       const newStatus = running ? "running" : status || "stopped";
@@ -39,7 +41,10 @@ export async function DELETE(
 
   // Stop container via manager
   try {
-    await fetch(`${MANAGER_URL}/deployments/${deployment.container_id}`, { method: "DELETE" });
+    await fetch(`${MANAGER_URL}/deployments/${deployment.container_id}`, {
+      method: "DELETE",
+      headers: managerHeaders(),
+    });
   } catch (e) {
     console.error("Failed to stop deployment container:", e);
   }

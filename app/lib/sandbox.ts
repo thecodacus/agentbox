@@ -5,7 +5,7 @@ import { z } from "zod";
 import { getDb, appendAgentActivity, appendVncLink } from "./db";
 import { nanoid } from "nanoid";
 
-const MANAGER_URL = process.env.MANAGER_URL || "http://localhost:4000";
+import { MANAGER_URL, managerHeaders } from "./manager";
 
 const openrouter = createOpenAICompatible({
   name: "openrouter",
@@ -18,7 +18,10 @@ const openrouter = createOpenAICompatible({
 async function managerFetch(path: string, options: RequestInit = {}) {
   const res = await fetch(`${MANAGER_URL}${path}`, {
     ...options,
-    headers: { "Content-Type": "application/json", ...options.headers },
+    headers: managerHeaders({
+      "Content-Type": "application/json",
+      ...(options.headers as Record<string, string> | undefined),
+    }),
   });
   return res.json();
 }
@@ -147,7 +150,9 @@ function createBrowserTools(sandboxId: string, onToolCall?: (name: string, args:
       description: "Take a screenshot of the current browser page",
       inputSchema: z.object({}),
       execute: wrap("screenshot", async () => {
-        const res = await fetch(`${MANAGER_URL}/sandboxes/${sandboxId}/screenshot`);
+        const res = await fetch(`${MANAGER_URL}/sandboxes/${sandboxId}/screenshot`, {
+          headers: managerHeaders(),
+        });
         const ct = res.headers.get("content-type") || "";
         if (ct.includes("image/")) {
           const buf = Buffer.from(await res.arrayBuffer());

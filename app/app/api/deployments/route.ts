@@ -1,7 +1,7 @@
 import { getDb, listDeployments, saveDeployment } from "@/lib/db";
 import { nanoid } from "nanoid";
 
-const MANAGER_URL = process.env.MANAGER_URL || "http://localhost:4000";
+import { MANAGER_URL, managerHeaders } from "@/lib/manager";
 
 export async function GET() {
   const deployments = listDeployments();
@@ -28,7 +28,7 @@ export async function POST(req: Request) {
   // Call manager to create the deployment container
   const managerRes = await fetch(`${MANAGER_URL}/deployments`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: managerHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
       type,
       volume: session.volume_name,

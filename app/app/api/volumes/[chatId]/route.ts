@@ -1,11 +1,14 @@
 import { getDb } from "@/lib/db";
 
-const MANAGER_URL = process.env.MANAGER_URL || "http://localhost:4000";
+import { MANAGER_URL, managerHeaders } from "@/lib/manager";
 
 async function managerFetch(path: string, options: RequestInit = {}) {
   const res = await fetch(`${MANAGER_URL}${path}`, {
     ...options,
-    headers: { "Content-Type": "application/json", ...options.headers },
+    headers: managerHeaders({
+      "Content-Type": "application/json",
+      ...(options.headers as Record<string, string> | undefined),
+    }),
   });
   return res.json();
 }

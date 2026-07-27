@@ -63,6 +63,43 @@ Open http://localhost:3000 and start chatting.
 - `sandbox-shell/` — Shell sandbox image (lightweight Alpine with Node, Python, Git)
 - `docker-compose.yml` — Manager service definition
 
+## Standalone MCP server (give an agent a sandbox)
+
+The manager also serves MCP on port 4001, independently of the web app. Point any
+MCP client at it and the agent gets shell execution, a filesystem, and a browser —
+all inside a hardened container.
+
+```bash
+docker compose up -d          # manager only; the Next.js app is optional
+claude mcp add --transport sse agentbox http://localhost:4001/mcp
+```
+
+### Session mode
+
+The agent never has to manage sandboxes. Every tool call resolves to **one
+persistent sandbox per session**, created on first use and reused after:
+
+```jsonc
+exec({ command: "python train.py" })     // no sandbox_id needed
+read_file({ path: "/workspace/out.log" })
+```
+
+Files under `/workspace` live in a Docker volume named after the session, so they
+survive sandbox restarts, idle reaping, and manager restarts. Kill the sandbox
+mid-session and the next call transparently starts a new one with the same
+workspace still intact.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGENTBOX_SESSION_ID` | `default` | Names the session and its volume (`agentbox-session-<id>`). Give each agent its own id to keep their workspaces separate; keep it stable or the agent comes back to an empty workspace. |
+
+`session_info` reports the current session, its volume, and live sandboxes.
+`sandbox_id` is still accepted on every tool for callers that want to manage
+sandboxes explicitly, and `create_sandbox` mounts the session volume by default.
+
+Shell tools and browser tools each get their own sandbox (different images), both
+tied to the same workspace volume.
+
 ## Environment
 
 The app uses OpenRouter for LLM access. Get a key at https://openrouter.ai and put it in `app/.env.local`.

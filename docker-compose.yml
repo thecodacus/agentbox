@@ -13,6 +13,9 @@ services:
       # Shared secret required on every manager API call.
       # Generate with: openssl rand -hex 32
       - MANAGER_TOKEN=${MANAGER_TOKEN:-}
+      # Session identity for the standalone MCP server. Names the workspace
+      # volume — keep it stable, use different ids per agent.
+      - AGENTBOX_SESSION_ID=${AGENTBOX_SESSION_ID:-default}
       # Resource caps for spawned containers — see README
       - SANDBOX_MEMORY_MB=${SANDBOX_MEMORY_MB:-1024}
       - SANDBOX_CPUS=${SANDBOX_CPUS:-1}

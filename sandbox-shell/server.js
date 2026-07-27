@@ -8,29 +8,52 @@ app.use(express.json());
 
 const WORK_DIR = '/workspace';
 
+// Normally a Docker volume is mounted here, but a sandbox can be started
+// without one. Make sure it exists so commands don't fail with an opaque
+// "spawn /bin/sh ENOENT" from an invalid working directory.
+try {
+  if (!existsSync(WORK_DIR)) mkdirSync(WORK_DIR, { recursive: true });
+} catch (e) {
+  console.error(`Could not create ${WORK_DIR}: ${e.message}`);
+}
+
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // Execute command
-app.post('/exec', async (req, res) => {
-  try {
-    const { command, timeout = 30000, cwd } = req.body;
-    if (!command) return res.status(400).json({ error: 'command required' });
+app.post('/exec', (req, res) => {
+  const { command, timeout = 30000, cwd } = req.body;
+  if (!command) return res.status(400).json({ error: 'command required' });
 
-    const output = execSync(command, {
+  // Async exec, not execSync: the synchronous version blocked Node's event loop
+  // for the entire duration of the command, so one long-running command froze
+  // the health check and every other request to this sandbox.
+  //
+  // maxBuffer is raised well above the 1 MB default because build and install
+  // output routinely exceeds it, and overflowing it kills the command outright.
+  exec(
+    command,
+    {
       timeout,
       encoding: 'utf-8',
       cwd: cwd || WORK_DIR,
       env: { ...process.env, HOME: WORK_DIR },
-    });
-    res.json({ stdout: output, exitCode: 0 });
-  } catch (e) {
-    res.json({
-      stdout: e.stdout || '',
-      stderr: e.stderr || '',
-      exitCode: e.status || 1,
-    });
-  }
+      maxBuffer: 10 * 1024 * 1024,
+    },
+    (err, stdout, stderr) => {
+      if (err) {
+        const timedOut = err.killed && err.signal === 'SIGTERM';
+        return res.json({
+          stdout: stdout || '',
+          stderr: timedOut ? `Command timed out after ${timeout}ms` : stderr || err.message,
+          exitCode: typeof err.code === 'number' ? err.code : 1,
+        });
+      }
+      const result = { stdout, exitCode: 0 };
+      if (stderr) result.stderr = stderr;
+      res.json(result);
+    }
+  );
 });
 
 // Read file

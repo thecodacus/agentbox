@@ -25,6 +25,17 @@ function isValidVolumeName(name) {
   return typeof name === 'string' && VOLUME_NAME_RE.test(name);
 }
 
+// Deployment workdir: a relative path under /workspace. Restricted to safe
+// characters because it is interpolated into a shell command, and rejects ".."
+// so a deployment can't be pointed outside the workspace it was given.
+const WORKDIR_RE = /^[a-zA-Z0-9._\-/]+$/;
+function isValidWorkdir(wd) {
+  if (typeof wd !== 'string') return false;
+  if (!WORKDIR_RE.test(wd)) return false;
+  if (wd.startsWith('/')) return false;
+  return !wd.split('/').includes('..');
+}
+
 async function pullImageIfMissing(image) {
   try {
     await docker.getImage(image).inspect();
@@ -210,6 +221,9 @@ app.delete('/sandboxes/:id', async (req, res) => {
 // Delete a named volume
 app.delete('/volumes/:name', async (req, res) => {
   try {
+    if (!isValidVolumeName(req.params.name)) {
+      return res.status(400).json({ error: 'Invalid volume name' });
+    }
     const volume = docker.getVolume(req.params.name);
     await volume.remove({ force: true });
     res.json({ ok: true });
@@ -231,16 +245,21 @@ app.post('/deployments', async (req, res) => {
     const portList = Array.isArray(ports) && ports.length > 0 ? ports : [8080];
     const mainPort = portList[0];
     const wd = workdir || '';
+    // wd is interpolated into a shell command below, so it has to be boring:
+    // no shell metacharacters, no absolute paths, no traversal out of /workspace.
+    if (wd && !isValidWorkdir(wd)) {
+      return res.status(400).json({ error: 'Invalid workdir' });
+    }
 
     let cmd;
     if (type === 'static') {
-      cmd = `cd /workspace/${wd} && python -m http.server ${mainPort}`;
+      cmd = `cd "/workspace/${wd}" && python -m http.server ${mainPort}`;
     } else if (type === 'node') {
       if (!command) return res.status(400).json({ error: 'command required for node' });
-      cmd = `cd /workspace/${wd} && (npm install --silent 2>/dev/null || true) && ${command}`;
+      cmd = `cd "/workspace/${wd}" && (npm install --silent 2>/dev/null || true) && ${command}`;
     } else if (type === 'python') {
       if (!command) return res.status(400).json({ error: 'command required for python' });
-      cmd = `cd /workspace/${wd} && (pip install -r requirements.txt --quiet 2>/dev/null || true) && ${command}`;
+      cmd = `cd "/workspace/${wd}" && (pip install -r requirements.txt --quiet 2>/dev/null || true) && ${command}`;
     }
 
     console.log(`[Deploy] Pulling ${image}...`);

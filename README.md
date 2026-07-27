@@ -66,3 +66,13 @@ Open http://localhost:3000 and start chatting.
 ## Environment
 
 The app uses OpenRouter for LLM access. Get a key at https://openrouter.ai and put it in `app/.env.local`.
+
+### Manager
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BIND_HOST` | `127.0.0.1` | Host interface that sandbox noVNC and deployment ports are published on. Loopback by default so sandboxes aren't reachable from the rest of your network. Set to `0.0.0.0` only if you deliberately want LAN access. |
+
+The sandbox control API (port 8080) is never published to the host — it is
+unauthenticated and would grant command execution inside the sandbox to anyone who
+can reach it. The manager talks to it over the internal Docker network instead.

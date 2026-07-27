@@ -8,6 +8,14 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - MANAGER_URL=http://localhost:4000
+      # Resource caps for spawned containers — see README
+      - SANDBOX_MEMORY_MB=${SANDBOX_MEMORY_MB:-1024}
+      - SANDBOX_CPUS=${SANDBOX_CPUS:-1}
+      - BROWSER_MEMORY_MB=${BROWSER_MEMORY_MB:-3072}
+      - DEPLOYMENT_MEMORY_MB=${DEPLOYMENT_MEMORY_MB:-512}
+      # Interface that sandbox/deployment ports are published on.
+      # Loopback by default — set to 0.0.0.0 only if you want LAN access.
+      - BIND_HOST=${BIND_HOST:-127.0.0.1}
     restart: unless-stopped
 
 networks:

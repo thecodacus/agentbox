@@ -59,6 +59,23 @@ const DEPLOYMENT_IMAGES = {
 const NETWORK_NAME = 'agentbox-net';
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
+// Numeric env override with a sane fallback on missing or garbage input.
+const num = (v, fallback) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : fallback);
+
+// Sandbox tracking lives in memory, so anything the manager forgets — because it
+// crashed, restarted, or was redeployed — would otherwise run forever with no
+// idle timer and nothing to find it by. Every container we create is labelled so
+// it can always be identified as ours and reclaimed.
+const LABEL_SANDBOX = 'agentbox.sandbox';
+const LABEL_DEPLOYMENT = 'agentbox.deployment';
+
+const SWEEP_INTERVAL_MS = num(process.env.SWEEP_INTERVAL_MS, 5 * 60 * 1000);
+// A sandbox is registered a moment after it is created; don't let the sweep race
+// that window and kill a container that is still being set up.
+const REAP_GRACE_MS = num(process.env.REAP_GRACE_MS, 2 * 60 * 1000);
+// Backstop for a sandbox kept alive indefinitely by continuous activity.
+const MAX_SANDBOX_AGE_MS = num(process.env.MAX_SANDBOX_AGE_MS, 4 * 60 * 60 * 1000);
+
 // Capabilities are dropped wholesale and only these are handed back: enough for
 // the image entrypoint to fix the mounted volume's ownership (CHOWN/DAC_OVERRIDE/
 // FOWNER) and drop to the unprivileged user (SETUID/SETGID). Once it has dropped
@@ -80,7 +97,6 @@ function securityHardening() {
 // infinite loop, a memory balloon or a fork bomb is an ordinary Tuesday — without
 // limits any of them takes the host down with it.
 const MB = 1024 * 1024;
-const num = (v, fallback) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : fallback);
 
 const SANDBOX_MEMORY_MB = num(process.env.SANDBOX_MEMORY_MB, 1024);
 // Chromium is heavy and its /dev/shm counts against the container's memory
@@ -170,9 +186,89 @@ async function destroySandbox(id) {
   } catch {}
   try {
     await sb.container.remove({ force: true });
-  } catch {}
+  } catch (e) {
+    // 404 means it is already gone — anything else means the container may still
+    // be running. Keep tracking it so the sweep can retry rather than silently
+    // forgetting a live container, which is how orphans used to appear.
+    if (e.statusCode !== 404) {
+      console.error(`Sandbox ${id}: removal failed (${e.message}) — will retry`);
+      return;
+    }
+  }
   sandboxes.delete(id);
   console.log(`Sandbox ${id} destroyed`);
+}
+
+/** Remove a container we own that is not (or no longer) tracked. */
+async function removeContainerById(containerId, reason) {
+  try {
+    const c = docker.getContainer(containerId);
+    try { await c.stop({ t: 2 }); } catch {}
+    await c.remove({ force: true });
+    console.log(`Reaped ${containerId.slice(0, 12)} (${reason})`);
+    return true;
+  } catch (e) {
+    if (e.statusCode === 404) return true; // already gone
+    console.error(`Failed to reap ${containerId.slice(0, 12)}: ${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * Reclaim sandboxes the manager is no longer tracking.
+ *
+ * Sandbox state is in memory, so a crash or restart leaves the Map empty while
+ * the containers keep running — with no idle timer left to stop them. Labels let
+ * us find them again.
+ *
+ * At startup nothing is tracked and nothing is mid-creation, so every labelled
+ * sandbox is by definition an orphan. During periodic sweeps a grace period
+ * protects containers that are still being registered.
+ */
+async function reapOrphanSandboxes({ startup = false } = {}) {
+  let containers;
+  try {
+    containers = await docker.listContainers({
+      all: true,
+      filters: { label: [`${LABEL_SANDBOX}=true`] },
+    });
+  } catch (e) {
+    console.error(`Orphan sweep failed to list containers: ${e.message}`);
+    return 0;
+  }
+
+  let reaped = 0;
+  for (const info of containers) {
+    const shortId = info.Id.slice(0, 12);
+    if (sandboxes.has(shortId)) continue; // tracked and alive — leave it alone
+
+    const ageMs = Date.now() - info.Created * 1000;
+    if (!startup && ageMs < REAP_GRACE_MS) continue; // may still be registering
+
+    if (await removeContainerById(info.Id, startup ? 'orphan at startup' : 'untracked')) {
+      reaped++;
+    }
+  }
+  if (reaped > 0) {
+    console.log(`Orphan sweep: reclaimed ${reaped} sandbox container(s)`);
+  }
+  return reaped;
+}
+
+/** Stop tracked sandboxes that have outlived the hard age cap. */
+async function enforceMaxAge() {
+  const now = Date.now();
+  for (const [id, sb] of [...sandboxes]) {
+    if (now - sb.createdAt > MAX_SANDBOX_AGE_MS) {
+      console.log(`Sandbox ${id} exceeded max age — destroying`);
+      await destroySandbox(id);
+    }
+  }
+}
+
+async function sweep() {
+  await enforceMaxAge();
+  await reapOrphanSandboxes();
 }
 
 async function waitForHealthUrl(baseUrl, retries = 30) {
@@ -224,6 +320,13 @@ app.post('/sandboxes', async (req, res) => {
         PortBindings: {},
       },
       ExposedPorts: { '8080/tcp': {} },
+      // Labels are what make an orphan recoverable: without them a sandbox the
+      // manager has forgotten is indistinguishable from any other container.
+      Labels: {
+        [LABEL_SANDBOX]: 'true',
+        'agentbox.type': type,
+        ...(volume ? { 'agentbox.volume': volume } : {}),
+      },
     };
 
     if (volume) {
@@ -241,29 +344,43 @@ app.post('/sandboxes', async (req, res) => {
     }
 
     const container = await docker.createContainer(containerConfig);
-    await container.start();
-    const info = await container.inspect();
 
-    const ports = info.NetworkSettings.Ports;
-    const novncPort = isBrowser ? ports['6080/tcp']?.[0]?.HostPort : null;
-    const id = info.Id.slice(0, 12);
+    // From here the container exists on the host but is not yet tracked. If
+    // anything throws before it is registered we must remove it ourselves —
+    // otherwise it runs on with nothing holding a reference to it.
+    let id;
+    try {
+      await container.start();
+      const info = await container.inspect();
 
-    const networkInfo = info.NetworkSettings.Networks[NETWORK_NAME];
-    const containerIp = networkInfo?.IPAddress;
-    const internalApiUrl = `http://${containerIp}:8080`;
+      const ports = info.NetworkSettings.Ports;
+      const novncPort = isBrowser ? ports['6080/tcp']?.[0]?.HostPort : null;
+      id = info.Id.slice(0, 12);
 
-    const sb = {
-      container,
-      type,
-      volume: volume || null,
-      internalApiUrl,
-      novncPort: novncPort ? parseInt(novncPort) : null,
-      createdAt: Date.now(),
-      lastActivity: Date.now(),
-      timer: null,
-    };
-    sandboxes.set(id, sb);
-    resetIdleTimer(id);
+      const networkInfo = info.NetworkSettings.Networks[NETWORK_NAME];
+      const containerIp = networkInfo?.IPAddress;
+      const internalApiUrl = `http://${containerIp}:8080`;
+
+      const sb = {
+        container,
+        type,
+        volume: volume || null,
+        internalApiUrl,
+        novncPort: novncPort ? parseInt(novncPort) : null,
+        createdAt: Date.now(),
+        lastActivity: Date.now(),
+        timer: null,
+      };
+      sandboxes.set(id, sb);
+      resetIdleTimer(id);
+    } catch (e) {
+      await removeContainerById(container.id, 'failed during startup');
+      throw e;
+    }
+
+    const sb = sandboxes.get(id);
+    const internalApiUrl = sb.internalApiUrl;
+    const novncPort = sb.novncPort;
 
     const healthy = await waitForHealthUrl(internalApiUrl);
     if (!healthy) {
@@ -390,7 +507,7 @@ app.post('/deployments', async (req, res) => {
         ...securityHardening(),
         ...resourceLimits(DEPLOYMENT_MEMORY_MB, DEPLOYMENT_CPUS, DEPLOYMENT_PIDS_LIMIT),
       },
-      Labels: { 'agentbox.deployment': 'true' },
+      Labels: { [LABEL_DEPLOYMENT]: 'true', 'agentbox.volume': volume },
     });
     await container.start();
 
@@ -468,9 +585,71 @@ app.all('/sandboxes/:id/*', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Manager API listening on port ${PORT}`);
+// List containers we own that the manager is not tracking, for diagnostics.
+app.get('/orphans', async (req, res) => {
+  try {
+    const containers = await docker.listContainers({
+      all: true,
+      filters: { label: [`${LABEL_SANDBOX}=true`] },
+    });
+    const orphans = containers
+      .filter((c) => !sandboxes.has(c.Id.slice(0, 12)))
+      .map((c) => ({
+        id: c.Id.slice(0, 12),
+        state: c.State,
+        ageSeconds: Math.round(Date.now() / 1000 - c.Created),
+        type: c.Labels['agentbox.type'],
+      }));
+    res.json({ tracked: sandboxes.size, orphans });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-module.exports = { sandboxes, destroySandbox, resetIdleTimer, waitForHealthUrl };
+// Reap orphans on demand.
+app.post('/orphans/reap', async (req, res) => {
+  const reaped = await reapOrphanSandboxes({ startup: true });
+  res.json({ reaped });
+});
+
+const PORT = process.env.PORT || 4000;
+const server = app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`Manager API listening on port ${PORT}`);
+
+  // Nothing is tracked yet and nothing is mid-creation, so any labelled sandbox
+  // still running belongs to a previous life of this process — reclaim it.
+  await reapOrphanSandboxes({ startup: true });
+
+  const sweepTimer = setInterval(() => {
+    sweep().catch((e) => console.error(`Sweep failed: ${e.message}`));
+  }, SWEEP_INTERVAL_MS);
+  sweepTimer.unref(); // never hold the process open just to sweep
+});
+
+// Without this, stopping the manager (docker compose down, redeploy, Ctrl-C)
+// left every sandbox it had spawned running with nothing left to reap them.
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received — destroying ${sandboxes.size} sandbox(es)`);
+  try {
+    await Promise.all([...sandboxes.keys()].map((id) => destroySandbox(id)));
+  } catch (e) {
+    console.error(`Shutdown cleanup error: ${e.message}`);
+  }
+  server.close(() => process.exit(0));
+  // Don't hang forever if a connection refuses to close.
+  setTimeout(() => process.exit(0), 10000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+module.exports = {
+  sandboxes,
+  destroySandbox,
+  resetIdleTimer,
+  waitForHealthUrl,
+  reapOrphanSandboxes,
+};

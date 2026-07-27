@@ -18,6 +18,24 @@ const DEPLOYMENT_IMAGES = {
 const NETWORK_NAME = 'agentbox-net';
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
+// Capabilities are dropped wholesale and only these are handed back: enough for
+// the image entrypoint to fix the mounted volume's ownership (CHOWN/DAC_OVERRIDE/
+// FOWNER) and drop to the unprivileged user (SETUID/SETGID). Once it has dropped
+// privileges the workload itself holds no capabilities at all.
+//
+// Notably absent: SYS_ADMIN. Chromium already launches with --no-sandbox, so it
+// never needed the one capability most associated with container escapes.
+const REQUIRED_CAPS = ['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETUID', 'SETGID'];
+
+/** Capability + privilege-escalation hardening applied to every spawned container. */
+function securityHardening() {
+  return {
+    CapDrop: ['ALL'],
+    CapAdd: [...REQUIRED_CAPS],
+    SecurityOpt: ['no-new-privileges'],
+  };
+}
+
 // Docker volume name: letters/digits/underscore/dot/dash, must start alphanumeric.
 // Rejects host paths (/, :, ..) so a malicious client can't bind-mount host dirs.
 const VOLUME_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,254}$/;
@@ -111,6 +129,7 @@ app.post('/sandboxes', async (req, res) => {
         PublishAllPorts: true,
         NetworkMode: NETWORK_NAME,
         Binds: [],
+        ...securityHardening(),
       },
       ExposedPorts: { '8080/tcp': {} },
     };
@@ -120,7 +139,7 @@ app.post('/sandboxes', async (req, res) => {
     }
 
     if (isBrowser) {
-      containerConfig.HostConfig.CapAdd = ['SYS_ADMIN'];
+      // No SYS_ADMIN: Chromium runs with --no-sandbox, verified working without it.
       containerConfig.HostConfig.ShmSize = 2 * 1024 * 1024 * 1024;
       containerConfig.ExposedPorts['6080/tcp'] = {};
     }
@@ -260,6 +279,7 @@ app.post('/deployments', async (req, res) => {
         Binds: [`${volume}:/workspace`],
         PublishAllPorts: true,
         NetworkMode: NETWORK_NAME,
+        ...securityHardening(),
       },
       Labels: { 'agentbox.deployment': 'true' },
     });

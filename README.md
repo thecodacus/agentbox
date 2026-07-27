@@ -91,7 +91,12 @@ workspace still intact.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGENTBOX_SESSION_ID` | `default` | Names the session and its volume (`agentbox-session-<id>`). Give each agent its own id to keep their workspaces separate; keep it stable or the agent comes back to an empty workspace. |
+| `AGENTBOX_SESSION_MODE` | `fixed` | `fixed` — all connections share one session, so an agent reconnecting later finds its files again. `per-connection` — each connection gets an isolated workspace, deleted when it disconnects. |
+| `AGENTBOX_SESSION_ID` | `default` | Names the fixed session and its volume (`agentbox-session-<id>`). Give each agent its own id to keep workspaces separate; keep it stable or the agent comes back to an empty workspace. Ignored in `per-connection` mode. |
+
+Pick `fixed` when you're giving the MCP to one agent that should accumulate state
+across runs. Pick `per-connection` for concurrent or mutually untrusted clients —
+each gets a private `/workspace` that is destroyed on disconnect.
 
 `session_info` reports the current session, its volume, and live sandboxes.
 `sandbox_id` is still accepted on every tool for callers that want to manage

@@ -8,71 +8,108 @@ const MANAGER_TOKEN = process.env.MANAGER_TOKEN || '';
 
 // --- Session mode ---
 //
-// When this MCP server is handed to an external agent, sandbox lifecycle is
-// noise: the agent should just run code and find its files where it left them.
-// So the server owns a single session identity, and every tool call resolves to
-// that session's sandbox automatically. sandbox_id stays available for callers
-// that genuinely want to manage sandboxes themselves.
+// Handing this MCP to an agent should not hand it sandbox lifecycle management:
+// every tool resolves to its session's sandbox automatically, and files under
+// /workspace live in that session's volume. sandbox_id stays available for
+// callers that genuinely want to manage sandboxes themselves.
+
+// Two ways to scope a workspace, chosen by AGENTBOX_SESSION_MODE:
 //
-// The id is stable across restarts on purpose — it names the Docker volume, so
-// changing it would hand the agent an empty workspace. Use different ids to keep
-// different agents isolated from each other.
-const SESSION_ID = process.env.AGENTBOX_SESSION_ID || 'default';
-const SESSION_VOLUME = `agentbox-session-${SESSION_ID}`;
+//   fixed           (default) — every connection shares one session id, so an
+//                   agent reconnecting later comes back to the same workspace.
+//                   This is what you want when handing the MCP to one agent.
+//
+//   per-connection  — each MCP connection gets its own isolated session, and its
+//                   workspace is deleted when the connection closes. Use this to
+//                   keep concurrent or untrusted clients from seeing each
+//                   other's files.
+const SESSION_MODE = (process.env.AGENTBOX_SESSION_MODE || 'fixed').toLowerCase();
+const FIXED_SESSION_ID = process.env.AGENTBOX_SESSION_ID || 'default';
 
-// One long-lived sandbox per type: shell tools and browser tools need different
-// images, but each should be reused for the whole session.
-const sessionSandboxes = new Map(); // type -> sandbox id
-const inFlight = new Map(); // type -> Promise, so parallel calls create only one
-
-async function isAlive(sandboxId) {
-  try {
-    const info = await managerFetch(`/sandboxes/${sandboxId}`);
-    return Boolean(info && !info.error);
-  } catch {
-    return false;
-  }
+if (!['fixed', 'per-connection'].includes(SESSION_MODE)) {
+  console.error(`[agentbox] unknown AGENTBOX_SESSION_MODE '${SESSION_MODE}', falling back to 'fixed'`);
 }
+const EPHEMERAL = SESSION_MODE === 'per-connection';
 
 /**
- * The session's sandbox for a given type, created on first use and reused after.
- * Revalidated each call because the manager may have reaped it (idle timeout) or
- * restarted since we last looked.
+ * Per-session state: which sandboxes are live and which volume holds the files.
+ * One of these exists per connection in per-connection mode, or one shared
+ * instance in fixed mode.
  */
-async function getSessionSandbox(type) {
-  const cached = sessionSandboxes.get(type);
-  if (cached && (await isAlive(cached))) return cached;
-  sessionSandboxes.delete(type);
+function createSession(sessionId) {
+  const volume = `agentbox-session-${sessionId}`;
+  const sandboxes = new Map(); // type -> sandbox id
+  const inFlight = new Map(); // type -> Promise, so parallel calls create only one
 
-  if (inFlight.has(type)) return inFlight.get(type);
-
-  const creating = (async () => {
-    const result = await managerFetch('/sandboxes', {
-      method: 'POST',
-      body: JSON.stringify({ type, volume: SESSION_VOLUME }),
-    });
-    if (!result || result.error || !result.id) {
-      throw new Error(`Could not start ${type} sandbox: ${result?.error || 'unknown error'}`);
+  async function isAlive(sandboxId) {
+    try {
+      const info = await managerFetch(`/sandboxes/${sandboxId}`);
+      return Boolean(info && !info.error);
+    } catch {
+      return false;
     }
-    sessionSandboxes.set(type, result.id);
-    console.error(`[agentbox] session '${SESSION_ID}': ${type} sandbox ${result.id} on ${SESSION_VOLUME}`);
-    return result.id;
-  })();
-
-  inFlight.set(type, creating);
-  try {
-    return await creating;
-  } finally {
-    inFlight.delete(type);
   }
-}
 
-/** Explicit sandbox_id wins; otherwise fall back to the session's sandbox. */
-function sandboxFor(type) {
-  return async (explicitId) => explicitId || getSessionSandbox(type);
+  // Created on first use and reused after. Revalidated every call because the
+  // manager may have reaped it (idle timeout) or restarted since we last looked.
+  async function getSandbox(type) {
+    const cached = sandboxes.get(type);
+    if (cached && (await isAlive(cached))) return cached;
+    sandboxes.delete(type);
+
+    if (inFlight.has(type)) return inFlight.get(type);
+
+    const creating = (async () => {
+      const result = await managerFetch('/sandboxes', {
+        method: 'POST',
+        body: JSON.stringify({ type, volume }),
+      });
+      if (!result || result.error || !result.id) {
+        throw new Error(`Could not start ${type} sandbox: ${result?.error || 'unknown error'}`);
+      }
+      sandboxes.set(type, result.id);
+      console.error(`[agentbox] session '${sessionId}': ${type} sandbox ${result.id} on ${volume}`);
+      return result.id;
+    })();
+
+    inFlight.set(type, creating);
+    try {
+      return await creating;
+    } finally {
+      inFlight.delete(type);
+    }
+  }
+
+  // Explicit sandbox_id wins; otherwise fall back to this session's sandbox.
+  const shellSandbox = async (explicitId) => explicitId || getSandbox('shell');
+  const browserSandbox = async (explicitId) => explicitId || getSandbox('browser');
+
+  /**
+   * Tear down the session. Sandboxes always go; the volume only in
+   * per-connection mode, where the workspace is scoped to the connection.
+   * A fixed session's volume must survive so the agent finds its files again.
+   */
+  async function cleanup() {
+    for (const [type, id] of [...sandboxes]) {
+      try {
+        await managerFetch(`/sandboxes/${id}`, { method: 'DELETE' });
+      } catch (e) {
+        console.error(`[agentbox] failed to destroy ${type} sandbox ${id}: ${e.message}`);
+      }
+      sandboxes.delete(type);
+    }
+    if (EPHEMERAL) {
+      try {
+        await managerFetch(`/volumes/${volume}`, { method: 'DELETE' });
+        console.error(`[agentbox] session '${sessionId}': removed workspace ${volume}`);
+      } catch (e) {
+        console.error(`[agentbox] failed to remove volume ${volume}: ${e.message}`);
+      }
+    }
+  }
+
+  return { sessionId, volume, sandboxes, shellSandbox, browserSandbox, cleanup };
 }
-const shellSandbox = sandboxFor('shell');
-const browserSandbox = sandboxFor('browser');
 
 const SANDBOX_ID_ARG = z
   .string()
@@ -97,10 +134,26 @@ async function managerFetch(path, options = {}) {
   return res.json();
 }
 
-const server = new McpServer({
-  name: 'agentbox',
-  version: '1.0.0',
-});
+
+/**
+ * A server instance is built per connection. The MCP SDK binds one transport per
+ * server, so sharing a single server across SSE connections would route replies
+ * to whichever client connected last.
+ */
+function buildServer(session) {
+  const server = new McpServer({ name: 'agentbox', version: '1.0.0' });
+  registerTools(server, session);
+  return server;
+}
+
+function registerTools(server, session) {
+  const {
+    shellSandbox,
+    browserSandbox,
+    sandboxes: sessionSandboxes,
+    sessionId: SESSION_ID,
+    volume: SESSION_VOLUME,
+  } = session;
 
 // --- Sandbox management tools ---
 
@@ -127,8 +180,11 @@ server.tool('session_info',
     session_id: SESSION_ID,
     workspace_volume: SESSION_VOLUME,
     workspace_path: '/workspace',
+    session_mode: SESSION_MODE,
     active_sandboxes: Object.fromEntries(sessionSandboxes),
-    note: 'Files under /workspace persist across sandbox restarts and agent runs.',
+    note: EPHEMERAL
+      ? 'Workspace is scoped to this connection and deleted when it closes.'
+      : 'Files under /workspace persist across sandbox restarts and agent runs.',
   };
   return { content: [{ type: 'text', text: JSON.stringify(info, null, 2) }] };
 });
@@ -337,26 +393,47 @@ server.tool('sandbox_info', 'Get system info from the sandbox', {
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 });
 
+}
+
 // --- SSE Transport ---
 
 const app = express();
-const transports = {};
+const connections = {};
+
+// In fixed mode every connection shares one session, so the sandboxes and the
+// workspace are shared too.
+const sharedSession = EPHEMERAL ? null : createSession(FIXED_SESSION_ID);
 
 app.get('/mcp', async (req, res) => {
   const transport = new SSEServerTransport('/mcp/message', res);
-  transports[transport.sessionId] = transport;
-  res.on('close', () => delete transports[transport.sessionId]);
-  await server.connect(transport);
+  const session = EPHEMERAL
+    ? createSession(`conn-${transport.sessionId}`)
+    : sharedSession;
+
+  connections[transport.sessionId] = { transport, session };
+  res.on('close', async () => {
+    delete connections[transport.sessionId];
+    // Only ephemeral sessions are torn down here: a fixed session outlives the
+    // connection so the next one reuses its sandboxes and files.
+    if (EPHEMERAL) await session.cleanup();
+  });
+
+  await buildServer(session).connect(transport);
 });
 
 app.post('/mcp/message', async (req, res) => {
   const sessionId = req.query.sessionId;
-  const transport = transports[sessionId];
-  if (!transport) return res.status(404).json({ error: 'Session not found' });
-  await transport.handlePostMessage(req, res);
+  const conn = connections[sessionId];
+  if (!conn) return res.status(404).json({ error: 'Session not found' });
+  await conn.transport.handlePostMessage(req, res);
 });
 
 const MCP_PORT = process.env.MCP_PORT || 4001;
 app.listen(MCP_PORT, '0.0.0.0', () => {
   console.log(`MCP server (SSE) listening on port ${MCP_PORT}`);
+  console.log(
+    EPHEMERAL
+      ? '  session mode: per-connection (isolated workspace, deleted on disconnect)'
+      : `  session mode: fixed — session '${FIXED_SESSION_ID}', workspace agentbox-session-${FIXED_SESSION_ID}`
+  );
 });

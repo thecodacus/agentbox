@@ -66,3 +66,21 @@ Open http://localhost:3000 and start chatting.
 ## Environment
 
 The app uses OpenRouter for LLM access. Get a key at https://openrouter.ai and put it in `app/.env.local`.
+
+### Manager resource limits
+
+Sandboxes and deployments run code an LLM just wrote, so every container is capped.
+Hitting the memory ceiling OOM-kills the container instead of dragging the host into
+swap, and `PidsLimit` contains fork bombs. Override per environment:
+
+| Variable | Default | Applies to |
+|---|---|---|
+| `SANDBOX_MEMORY_MB` | `1024` | shell sandboxes |
+| `SANDBOX_CPUS` | `1` | shell sandboxes (fractional allowed, e.g. `0.5`) |
+| `SANDBOX_PIDS_LIMIT` | `256` | shell sandboxes |
+| `BROWSER_MEMORY_MB` | `3072` | browser sandboxes (Chromium + 2 GB `/dev/shm`) |
+| `BROWSER_CPUS` | `2` | browser sandboxes |
+| `BROWSER_PIDS_LIMIT` | `512` | browser sandboxes |
+| `DEPLOYMENT_MEMORY_MB` | `512` | deployment containers |
+| `DEPLOYMENT_CPUS` | `1` | deployment containers |
+| `DEPLOYMENT_PIDS_LIMIT` | `128` | deployment containers |

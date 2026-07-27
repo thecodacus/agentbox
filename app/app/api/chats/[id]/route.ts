@@ -1,6 +1,6 @@
 import { getDb, listDeploymentsForChat, deleteDeployment } from "@/lib/db";
 
-const MANAGER_URL = process.env.MANAGER_URL || "http://localhost:4000";
+import { MANAGER_URL, managerHeaders } from "@/lib/manager";
 
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -35,7 +35,10 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
   const deployments = listDeploymentsForChat(id) as Array<{ id: string; container_id: string }>;
   for (const dep of deployments) {
     try {
-      await fetch(`${MANAGER_URL}/deployments/${dep.container_id}`, { method: "DELETE" });
+      await fetch(`${MANAGER_URL}/deployments/${dep.container_id}`, {
+        method: "DELETE",
+        headers: managerHeaders(),
+      });
     } catch (e) {
       console.error("Failed to stop deployment:", e);
     }
@@ -50,7 +53,10 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
   // Delete the volume via manager API
   if (session?.volume_name) {
     try {
-      await fetch(`${MANAGER_URL}/volumes/${session.volume_name}`, { method: "DELETE" });
+      await fetch(`${MANAGER_URL}/volumes/${session.volume_name}`, {
+        method: "DELETE",
+        headers: managerHeaders(),
+      });
     } catch (e) {
       console.error("Failed to delete volume:", e);
     }

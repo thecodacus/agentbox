@@ -2,12 +2,17 @@ services:
   manager:
     build: ./manager
     ports:
-      - "4000:4000"   # REST API
-      - "4001:4001"   # MCP SSE
+      # Loopback only: the manager controls Docker, so it must not be
+      # reachable from the network. Override BIND only if you know why.
+      - "${MANAGER_BIND:-127.0.0.1}:4000:4000"   # REST API
+      - "${MANAGER_BIND:-127.0.0.1}:4001:4001"   # MCP SSE
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - MANAGER_URL=http://localhost:4000
+      # Shared secret required on every manager API call.
+      # Generate with: openssl rand -hex 32
+      - MANAGER_TOKEN=${MANAGER_TOKEN:-}
     restart: unless-stopped
 
 networks:

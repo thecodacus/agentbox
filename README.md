@@ -66,3 +66,24 @@ Open http://localhost:3000 and start chatting.
 ## Environment
 
 The app uses OpenRouter for LLM access. Get a key at https://openrouter.ai and put it in `app/.env.local`.
+
+### Securing the manager
+
+The manager holds the Docker socket — reaching its API means controlling every
+container on the host. Sandboxes share `agentbox-net` with it, so code running
+inside a sandbox can address it directly. **Set a token:**
+
+```bash
+# repo root .env (used by docker-compose)
+MANAGER_TOKEN=$(openssl rand -hex 32)
+
+# app/.env.local — must be the same value
+MANAGER_TOKEN=<same token>
+```
+
+Every manager request then requires `Authorization: Bearer <token>` (or
+`X-Agentbox-Token`). `/health` stays open for probes. Without `MANAGER_TOKEN` the
+manager still runs — with a loud warning at boot — so existing setups keep working.
+
+The manager's published ports bind to `127.0.0.1` by default; override with
+`MANAGER_BIND` only if you deliberately want it reachable from the network.

@@ -1,10 +1,51 @@
 const express = require('express');
 const Docker = require('dockerode');
 const http = require('http');
+const crypto = require('crypto');
 
 const docker = new Docker({ socketPath: '/var/run/docker.sock' });
 const app = express();
 app.use(express.json());
+
+// The manager holds the Docker socket, so reaching it is equivalent to
+// controlling every container on the host. Sandboxes share agentbox-net with it
+// and can therefore address it directly by container IP — publishing ports only
+// on loopback does NOT protect against that. A shared secret does.
+const MANAGER_TOKEN = process.env.MANAGER_TOKEN || '';
+
+if (!MANAGER_TOKEN) {
+  console.warn(
+    '\n  WARNING: MANAGER_TOKEN is not set — the manager API is unauthenticated.\n' +
+    '  Any container on agentbox-net (including sandboxes running LLM-written\n' +
+    '  code) can spawn containers, start deployments and delete volumes.\n' +
+    '  Generate one with:  openssl rand -hex 32\n'
+  );
+}
+
+/** Constant-time compare so the token can't be recovered by timing the response. */
+function tokensMatch(provided, expected) {
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+app.use((req, res, next) => {
+  if (!MANAGER_TOKEN) return next(); // unauthenticated mode — warned about at boot
+  if (req.path === '/health') return next();
+
+  const header = req.get('authorization') || '';
+  const provided = header.startsWith('Bearer ')
+    ? header.slice(7)
+    : req.get('x-agentbox-token') || '';
+
+  if (!provided || !tokensMatch(provided, MANAGER_TOKEN)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 const SANDBOX_IMAGES = {
   browser: 'agentbox-sandbox',

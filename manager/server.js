@@ -48,6 +48,10 @@ function resourceLimits(memoryMb, cpus, pidsLimit) {
     PidsLimit: pidsLimit,
   };
 }
+// Host interface published container ports bind to. Defaults to loopback so
+// sandboxes and deployments are not reachable from the rest of the network.
+// Set BIND_HOST=0.0.0.0 only if you deliberately want LAN access.
+const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 
 // Docker volume name: letters/digits/underscore/dot/dash, must start alphanumeric.
 // Rejects host paths (/, :, ..) so a malicious client can't bind-mount host dirs.
@@ -136,15 +140,18 @@ app.post('/sandboxes', async (req, res) => {
 
     const isBrowser = type === 'browser';
     const MOUNT_TARGET = '/workspace';
+    // The sandbox control API (8080) is deliberately NOT published: it is
+    // unauthenticated, and the manager reaches it over the internal network by
+    // container IP. Only noVNC is published, on the loopback interface.
     const containerConfig = {
       Image: image,
       HostConfig: {
-        PublishAllPorts: true,
         NetworkMode: NETWORK_NAME,
         Binds: [],
         ...(isBrowser
           ? resourceLimits(BROWSER_MEMORY_MB, BROWSER_CPUS, BROWSER_PIDS_LIMIT)
           : resourceLimits(SANDBOX_MEMORY_MB, SANDBOX_CPUS, SANDBOX_PIDS_LIMIT)),
+        PortBindings: {},
       },
       ExposedPorts: { '8080/tcp': {} },
     };
@@ -157,6 +164,10 @@ app.post('/sandboxes', async (req, res) => {
       containerConfig.HostConfig.CapAdd = ['SYS_ADMIN'];
       containerConfig.HostConfig.ShmSize = 2 * 1024 * 1024 * 1024;
       containerConfig.ExposedPorts['6080/tcp'] = {};
+      // Empty HostPort => Docker picks a free port, as before.
+      containerConfig.HostConfig.PortBindings['6080/tcp'] = [
+        { HostIp: BIND_HOST, HostPort: '' },
+      ];
     }
 
     const container = await docker.createContainer(containerConfig);
@@ -283,7 +294,11 @@ app.post('/deployments', async (req, res) => {
     await ensureNetwork();
 
     const exposedPorts = {};
-    for (const p of portList) exposedPorts[`${p}/tcp`] = {};
+    const portBindings = {};
+    for (const p of portList) {
+      exposedPorts[`${p}/tcp`] = {};
+      portBindings[`${p}/tcp`] = [{ HostIp: BIND_HOST, HostPort: '' }];
+    }
 
     const container = await docker.createContainer({
       Image: image,
@@ -292,7 +307,7 @@ app.post('/deployments', async (req, res) => {
       ExposedPorts: exposedPorts,
       HostConfig: {
         Binds: [`${volume}:/workspace`],
-        PublishAllPorts: true,
+        PortBindings: portBindings,
         NetworkMode: NETWORK_NAME,
         ...resourceLimits(DEPLOYMENT_MEMORY_MB, DEPLOYMENT_CPUS, DEPLOYMENT_PIDS_LIMIT),
       },

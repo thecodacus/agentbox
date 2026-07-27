@@ -84,3 +84,12 @@ swap, and `PidsLimit` contains fork bombs. Override per environment:
 | `DEPLOYMENT_MEMORY_MB` | `512` | deployment containers |
 | `DEPLOYMENT_CPUS` | `1` | deployment containers |
 | `DEPLOYMENT_PIDS_LIMIT` | `128` | deployment containers |
+### Manager
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BIND_HOST` | `127.0.0.1` | Host interface that sandbox noVNC and deployment ports are published on. Loopback by default so sandboxes aren't reachable from the rest of your network. Set to `0.0.0.0` only if you deliberately want LAN access. |
+
+The sandbox control API (port 8080) is never published to the host — it is
+unauthenticated and would grant command execution inside the sandbox to anyone who
+can reach it. The manager talks to it over the internal Docker network instead.

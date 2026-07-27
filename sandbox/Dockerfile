@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     websockify \
     fluxbox \
     procps \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
@@ -23,10 +24,16 @@ RUN npm install --production
 
 COPY server.js .
 COPY start.sh .
-RUN chmod +x start.sh
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x start.sh /entrypoint.sh
 
-RUN chown -R sandbox:sandbox /home/sandbox
+# Owned by the sandbox user so a fresh named volume mounted here inherits
+# non-root ownership; the entrypoint fixes up pre-existing root-owned volumes.
+RUN mkdir -p /workspace && chown -R sandbox:sandbox /workspace /home/sandbox
 
 EXPOSE 6080 8080
 
+# The entrypoint starts as root only to fix volume ownership, then drops
+# privileges — Chromium and everything the agent drives run as uid 1000.
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["./start.sh"]
